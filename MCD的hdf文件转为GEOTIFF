@@ -1,0 +1,128 @@
+from pathlib import Path
+import shutil
+
+from pyhdf.SD import SD, SDC
+import rasterio
+from rasterio.transform import from_origin
+
+
+# =========================
+# 1. 输入文件路径
+# =========================
+
+mcd_hdf_path = Path(
+    r"C:\Users\linyu\Desktop\科研\MCD12C1 MODIS土地利用类型数据\MCD12C1_061-20260917_110254\MCD12C1.A2010001.061.2022161022952.hdf"
+)
+
+glc_path = Path(
+    r"C:\Users\linyu\Desktop\科研\GLC_FCS30D数据\E110-E115\2010年处理结果\GLC_2010_E110_E115_mosaic.tif"
+)
+
+
+# =========================
+# 2. 输出文件路径
+# =========================
+
+mcd_folder = mcd_hdf_path.parent
+output_dir = mcd_folder / "处理结果"
+output_dir.mkdir(exist_ok=True)
+
+mcd_tif_path = output_dir / "MCD12C1_2010_IGBP.tif"
+
+
+# =========================
+# 3. 检查文件是否存在
+# =========================
+
+if not mcd_hdf_path.exists():
+    raise FileNotFoundError(
+        f"MCD12C1 文件不存在：\n{mcd_hdf_path}"
+    )
+
+if not glc_path.exists():
+    raise FileNotFoundError(
+        f"GLC 拼接结果不存在：\n{glc_path}"
+    )
+
+
+# =========================
+# 4. 复制到简单英文路径
+# =========================
+# pyhdf 在 Windows 下有时无法直接读取带中文的路径
+
+simple_hdf_path = Path(
+    r"C:\Users\linyu\Desktop\mcd2010.hdf"
+)
+
+shutil.copy2(mcd_hdf_path, simple_hdf_path)
+
+print("HDF 文件已复制到：")
+print(simple_hdf_path)
+
+
+# =========================
+# 5. 打开 HDF 文件并查看子数据集
+# =========================
+
+hdf = SD(str(simple_hdf_path), SDC.READ)
+
+datasets = hdf.datasets()
+
+print("\nHDF 中包含的数据集：")
+for name, info in datasets.items():
+    print(name, info)
+
+
+# =========================
+# 6. 提取 Majority_Land_Cover_Type_1
+# =========================
+
+dataset_name = "Majority_Land_Cover_Type_1"
+
+if dataset_name not in datasets:
+    hdf.end()
+    raise KeyError(
+        f"HDF 文件中没有找到 {dataset_name}"
+    )
+
+sds = hdf.select(dataset_name)
+
+mcd_array = sds[:]
+mcd_attrs = sds.attributes()
+
+print("\nMCD 数据形状：", mcd_array.shape)
+print("MCD 数据类型：", mcd_array.dtype)
+print("MCD 属性：", mcd_attrs)
+
+
+# =========================
+# 7. 将 HDF 子数据集写成 GeoTIFF
+# =========================
+
+# MCD12C1 全球 0.05° 经纬度网格
+transform = from_origin(
+    -180,
+    90,
+    0.05,
+    0.05
+)
+
+profile = {
+    "driver": "GTiff",
+    "height": mcd_array.shape[0],
+    "width": mcd_array.shape[1],
+    "count": 1,
+    "dtype": str(mcd_array.dtype),
+    "crs": "EPSG:4326",
+    "transform": transform,
+    "nodata": 255,
+    "compress": "lzw"
+}
+
+with rasterio.open(mcd_tif_path, "w", **profile) as dst:
+    dst.write(mcd_array, 1)
+
+hdf.end()
+
+print("\nMCD12C1 已转换为 GeoTIFF：")
+print(mcd_tif_path)
