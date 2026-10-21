@@ -1,0 +1,262 @@
+"""MCD12C1.061 IGBP百分比裁剪、九类合并；不改动GLC。
+
+依赖：python -m pip install numpy rasterio pyhdf
+默认输出到本脚本旁outputs目录；每次新建文件夹，不覆盖旧结果。
+"""
+from pathlib import Path
+from datetime import datetime
+from contextlib import contextmanager
+import json
+import re
+import shutil
+import tempfile
+
+import numpy as np
+import rasterio
+from rasterio.transform import from_bounds
+from pyhdf.SD import SD, SDC
+
+
+HDF_PATH = Path(
+    r"C:\Users\linyu\Desktop\科研\MCD12C1 MODIS土地利用类型数据"
+    r"\MCD12C1_061-2010年\MCD12C1.A2010001.061.2022161022952.hdf"
+)
+GLC_EXTENT = Path(
+    r"C:\Users\linyu\Desktop\科研\GLC_FCS30D数据\E110-E115"
+    r"\2010年处理结果\GLC_2010_E110_E115_mosaic.tif"
+)
+GLC_GRID = GLC_EXTENT.parent / "统一分类结果" / "统一分辨率结果（保留聚合法）" / (
+    "GLC_2010_common9_聚合到MCD_grid.tif"
+)
+OUTPUT_ROOT = Path(__file__).resolve().parent / "outputs" / "MCD2010百分比_E110_E115"
+SDS_NAME = "Land_Cover_Type_1_Percent"
+NODATA = -9999.0
+
+# 原始MCD12C1 IGBP类别代码，与数组最后一维的下标一致。
+# 此处0为水体；GeoTIFF波段号则从1开始，二者不要混淆。
+GROUPS = [
+    ("水体", [0]),
+    ("森林", [1, 2, 3, 4, 5]),
+    ("灌木地与稀树草原", [6, 7, 8, 9]),
+    ("草地", [10]),
+    ("耕地", [12, 14]),
+    ("湿地", [11]),
+    ("建设用地", [13]),
+    ("裸地与稀疏植被", [16]),
+    ("冰雪", [15]),
+]
+IGBP_NAMES = [
+    "水体", "常绿针叶林", "常绿阔叶林", "落叶针叶林", "落叶阔叶林",
+    "混交林", "密灌木", "开放灌木", "木本稀树草原", "稀树草原",
+    "草地", "永久湿地", "耕地", "城市与建设用地", "耕地与自然植被镶嵌体",
+    "永久冰雪", "裸地与稀疏植被",
+]
+
+
+@contextmanager
+def open_hdf(path):
+    """部分Windows HDF4库不能打开中文路径，使用自动清理的英文临时副本。"""
+    try:
+        handle = SD(str(path), SDC.READ)
+    except Exception:
+        if str(path).isascii():
+            raise
+        if not str(Path(tempfile.gettempdir())).isascii():
+            raise RuntimeError("HDF4无法读取中文路径，且临时目录含中文；请将HDF复制到英文路径并修改HDF_PATH。")
+        print("HDF4中文路径兼容：正在创建临时英文路径副本……", flush=True)
+        with tempfile.TemporaryDirectory(prefix="mcd2010_") as folder:
+            local = Path(folder) / "source.hdf"
+            shutil.copyfile(path, local)
+            handle = SD(str(local), SDC.READ)
+            try:
+                yield handle
+            finally:
+                handle.end()
+        return
+    try:
+        yield handle
+    finally:
+        handle.end()
+
+
+def check_metadata(hdf, sds):
+    """只接受已核对的MCD12C1全球0.05度IGBP百分比网格。"""
+    struct = "\n".join(str(v) for k, v in hdf.attributes().items()
+                       if k.startswith("StructMetadata"))
+    if not re.search(r"Projection\s*=\s*GCTP_GEO", struct):
+        raise ValueError("HDF元数据不是预期的地理坐标网格。")
+    for key, expected in (("XDim", 7200), ("YDim", 3600)):
+        match = re.search(rf"\b{key}\s*=\s*(\d+)", struct)
+        if not match or int(match.group(1)) != expected:
+            raise ValueError(f"HDF的{key}不是预期值{expected}。")
+    for key, expected in (
+        ("UpperLeftPointMtrs", [-180000000, 90000000]),
+        ("LowerRightMtrs", [180000000, -90000000]),
+    ):
+        match = re.search(rf"{key}\s*=\s*\(([^)]+)\)", struct)
+        if not match or not np.allclose(
+            [float(x) for x in match.group(1).split(",")], expected, rtol=0, atol=0.001
+        ):
+            raise ValueError("HDF全球范围与已核对的MCD12C1网格不符。")
+    if tuple(sds.info()[2]) != (3600, 7200, 17):
+        raise ValueError(f"百分比数组维度异常：{sds.info()}，不能猜测类别轴。")
+    dims = [sds.dim(i).info()[0] for i in range(3)]
+    if not (dims[0].startswith("YDim") and dims[1].startswith("XDim")
+            and dims[2].startswith("Num_IGBP_Classes")):
+        raise ValueError(f"百分比数组轴顺序异常：{dims}")
+    attrs = sds.attributes()
+    expected_layers = [
+        "water", "evergreen needleleaf forest", "evergreen broadleaf forest",
+        "deciduous needleleaf forest", "deciduous broadleaf forest", "mixed forests",
+        "closed shrubland", "open shrublands", "woody savannas", "savannas",
+        "grasslands", "permanent wetlands", "croplands", "urban and built-up",
+        "cropland/natural vegetation mosaic", "snow and ice", "barren or sparsely vegetated",
+    ]
+    for code, expected in enumerate(expected_layers):
+        if str(attrs.get(f"Layer {code}", "")).strip().lower() != expected:
+            raise ValueError(f"Layer {code}的类别说明与预期不符，停止以防类别错位。")
+    if float(attrs.get("scale_factor", 1)) != 1 or float(attrs.get("add_offset", 0)) != 0:
+        raise ValueError("百分比缩放参数不是预期的直接0--100，需要先核对。")
+    return attrs
+
+
+def grid_window():
+    """复用现有GLC比例网格，读取对应MCD原生格点，无插值。"""
+    native = from_bounds(-180, -90, 180, 90, 7200, 3600)
+    with rasterio.open(GLC_EXTENT) as fine, rasterio.open(GLC_GRID) as grid:
+        if (fine.crs is None or grid.crs is None
+                or fine.crs.to_epsg() != 4326 or grid.crs.to_epsg() != 4326):
+            raise ValueError("输入必须使用EPSG:4326。")
+        if grid.count != 9:
+            raise ValueError("GLC网格模板必须是现有的九波段比例结果。")
+        t = grid.transform
+        if not np.allclose([t.a, t.b, t.d, t.e], [0.05, 0, 0, -0.05], rtol=0, atol=1e-10):
+            raise ValueError("GLC比例网格不是MCD的原生0.05度网格。")
+        col_float, row_float = ~native * (t.c, t.f)
+        col, row = round(col_float), round(row_float)
+        if not np.allclose([col, row], [col_float, row_float], rtol=0, atol=1e-6):
+            raise ValueError("GLC比例网格偏离MCD原生格点，停止以避免错位。")
+        if row < 0 or col < 0 or row + grid.height > 3600 or col + grid.width > 7200:
+            raise ValueError("目标范围超出全球MCD网格。")
+        if any(abs(a-b) > 0.050001 for a, b in zip(fine.bounds, grid.bounds)):
+            raise ValueError("GLC比例网格范围与指定mosaic相差超过一个MCD像元。")
+        profile = dict(driver="GTiff", width=grid.width, height=grid.height,
+                       crs=grid.crs, transform=t, dtype="float32", nodata=NODATA,
+                       tiled=True, blockxsize=256, blockysize=256,
+                       compress="deflate", predictor=3)
+        metadata = {"指定GLC范围": list(fine.bounds), "输出网格范围": list(grid.bounds),
+                    "行数": grid.height, "列数": grid.width,
+                    "HDF起始行": row, "HDF起始列": col}
+    return row, col, profile, metadata
+
+
+def merge_classes(raw, fill_value=255):
+    """raw为17×行×列；0%有效，填充值不参与求和。"""
+    if raw.ndim != 3 or raw.shape[0] != 17:
+        raise ValueError("需要17类百分比，而非Majority标签。")
+    valid = np.all(np.isfinite(raw) & (raw >= 0) & (raw <= 100)
+                   & (raw != fill_value), axis=0)
+    values = raw.astype(np.float64)
+    total = values.sum(axis=0)
+    valid &= total > 0
+    nine = np.stack([values[codes].sum(axis=0) for _, codes in GROUPS])
+    if not np.array_equal(nine.sum(axis=0), total):
+        raise AssertionError("合并类别未保持原比例总和。")
+    # 原始整数百分比可能因取整略偏离100；保留原值，另存闭合归一化版。
+    # 对大幅偏离100的格点不自动归一化，避免把缺失比例伪装成完整组成。
+    normal_valid = valid & (np.abs(total - 100) <= 8.5)
+    normalized = np.full(nine.shape, NODATA, dtype=np.float32)
+    normalized[:, normal_valid] = (nine[:, normal_valid] * 100 / total[normal_valid]).astype(np.float32)
+    raw_out = values.astype(np.float32)
+    nine = nine.astype(np.float32)
+    raw_out[:, ~valid] = NODATA
+    nine[:, ~valid] = NODATA
+    total_out = total.astype(np.float32)
+    total_out[~valid] = NODATA
+    return raw_out, nine, normalized, total_out, valid, normal_valid
+
+
+def write_raster(path, data, profile, descriptions, operation):
+    if data.ndim == 2:
+        data = data[None, :, :]
+    with rasterio.open(path, "w", count=len(descriptions), **profile) as dst:
+        dst.write(data)
+        dst.descriptions = tuple(descriptions)
+        dst.update_tags(source=str(HDF_PATH), source_dataset=SDS_NAME, year="2010",
+                        units="percent", operation=operation, grid_template=str(GLC_GRID),
+                        valid_zero="0 percent is valid; nodata=-9999")
+        for i, label in enumerate(descriptions, 1):
+            dst.update_tags(i, label=label, units="percent")
+    with rasterio.open(path) as src:
+        if src.transform != profile["transform"] or src.count != data.shape[0]:
+            raise AssertionError("写出网格或波段数不匹配。")
+        if not np.array_equal(src.read(), data):
+            raise AssertionError("输出读回与计算结果不一致。")
+
+
+def main():
+    for path in (HDF_PATH, GLC_EXTENT, GLC_GRID):
+        if not path.is_file():
+            raise FileNotFoundError(path)
+    row, col, profile, report = grid_window()
+    h, w = profile["height"], profile["width"]
+    print(f"目标网格：{h}行×{w}列；从HDF第{row}行、第{col}列读取。", flush=True)
+    with open_hdf(HDF_PATH) as hdf:
+        if SDS_NAME not in hdf.datasets():
+            raise ValueError(f"未找到{SDS_NAME}，可用数据集：{list(hdf.datasets())}")
+        sds = hdf.select(SDS_NAME)
+        try:
+            attrs = check_metadata(hdf, sds)
+            # 仅读取研究区，HDF的原始顺序为行、列、类别。
+            raw = np.moveaxis(sds.get(start=(row, col, 0), count=(h, w, 17)), 2, 0)
+        finally:
+            sds.endaccess()
+    raw17, nine, normalized, total, valid, normal_valid = merge_classes(raw, attrs.get("_FillValue", 255))
+    if not valid.any() or not normal_valid.any():
+        raise ValueError("没有可用的百分比格点，未生成正式结果。")
+    directory = OUTPUT_ROOT / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    directory.mkdir(parents=True, exist_ok=False)
+    outputs = [
+        ("MCD12C1_2010_IGBP17_percent_clip.tif", raw17,
+         [f"IGBP_{i}_{n}_pct" for i, n in enumerate(IGBP_NAMES)], "native_percentage_crop"),
+        ("MCD12C1_2010_common9_percent_raw.tif", nine,
+         [n + "比例_pct" for n, _ in GROUPS], "sum_original_class_percentages"),
+        ("MCD12C1_2010_common9_percent_normalized.tif", normalized,
+         [n + "比例_pct" for n, _ in GROUPS], "sum_then_normalize_to_100"),
+        ("MCD12C1_2010_original_percent_sum.tif", total, ["原始17类百分比总和"], "original_sum"),
+    ]
+    for name, data, descriptions, operation in outputs:
+        write_raster(directory / name, data, profile, descriptions, operation)
+        print("已生成并读回校验：", name, flush=True)
+    sums, counts = np.unique(total[valid], return_counts=True)
+    report.update({
+        "HDF": str(HDF_PATH), "子数据集": SDS_NAME, "GLC网格模板": str(GLC_GRID),
+        "总格网数": int(valid.size), "原始有效格网数": int(valid.sum()),
+        "归一化有效格网数": int(normal_valid.sum()),
+        "异常比例和格网数": int((valid & ~normal_valid).sum()),
+        "原始百分比和分布": {str(float(k)): int(v) for k, v in zip(sums, counts)},
+        "九类映射": {str(i): {"名称": n, "原始IGBP代码": c}
+                     for i, (n, c) in enumerate(GROUPS, 1)},
+        "归一化后总和最大误差_百分点": float(np.max(np.abs(normalized[:, normal_valid].sum(axis=0) - 100))),
+        "原始子数据集属性": attrs,
+    })
+    (directory / "处理记录.json").write_text(json.dumps(report, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    notes = (
+        "MCD12C1 2010 IGBP百分比裁剪和九类合并\n"
+        "raw文件仅将对应原始类别百分比相加，未进行归一化，是重分类主结果。\n"
+        "normalized文件另按原百分比总和归一化至100%，用于组成比例比较。\n"
+        "原百分比和与100相差超过8.5个百分点时，不做自动归一化，归一化版设为NoData。\n"
+        "0为有效百分比，-9999为NoData。类别0水体保留在输出波段1。\n"
+        "输出采用现有GLC比例网格；裁剪边界保留整格，不重采样、不改变GLC。\n"
+        "耕地/自然植被镶嵌体按既有标准全部并入耕地；这不是将其真实耕地比例拆分。\n"
+        "比例比较时仍需使用GLC有效面积覆盖率筛选共同有效格点。\n"
+        "旧Majority比较脚本不能直接读取本九波段文件，需要改用比例对比例比较。\n"
+        "完成：四个GeoTIFF均已读回校验。\n"
+    )
+    (directory / "结果说明.txt").write_text(notes, encoding="utf-8")
+    print("原始百分比和分布：", report["原始百分比和分布"])
+    print("完成，输出目录：", directory)
+
+
+if __name__ == "__main__":
+    main()
